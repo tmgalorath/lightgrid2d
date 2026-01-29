@@ -7,8 +7,8 @@ edition = "2024"
 minifb = "0.27"
 rayon = "1.10"
 
-# GPU-accelerated rendering with pixels
-pixels = "0.15"
+# GPU-accelerated rendering
+wgpu = "24"
 winit = "0.30"
 pollster = "0.4"
 env_logger = "0.11"

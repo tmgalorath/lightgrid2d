@@ -1,5 +1,6 @@
 mod attenuation;
 mod color;
+mod gpu;
 mod interactive;
 mod render;
 
@@ -10,7 +11,7 @@ mod tests;
 pub use attenuation::{Sweeping, flatten_grid, attenuation_to_string};
 pub use color::{RGBA, ColoredLight, apply_light_color, blend_lights, rgba_grid_to_string};
 pub use render::{save_ppm, save_ppm_with_walls, normalize_grid, normalize_grid_osb, normalize_grid_perceptual, NormalizationMode};
-pub use interactive::{InteractiveViewer, ViewerConfig};
+pub use interactive::{InteractiveViewer, ViewerConfig, run_gpu_viewer, GpuViewerConfig};
 
 fn main() {
     // Check for command line arguments
@@ -18,11 +19,14 @@ fn main() {
     
     if args.len() > 1 && args[1] == "--interactive" {
         run_interactive();
+    } else if args.len() > 1 && args[1] == "--gpu" {
+        run_gpu_interactive();
     } else if args.len() > 1 && args[1] == "--benchmark" {
         run_benchmark();
     } else {
         println!("Lighting Test");
-        println!("Run with --interactive for minifb viewer");
+        println!("Run with --interactive for minifb viewer (CPU)");
+        println!("Run with --gpu for wgpu viewer (GPU display)");
         println!("Run with --benchmark to test performance");
     }
 }
@@ -105,5 +109,13 @@ fn run_interactive() {
         Err(e) => {
             eprintln!("Failed to create viewer: {}", e);
         }
+    }
+}
+
+fn run_gpu_interactive() {
+    let config = GpuViewerConfig::default();
+    
+    if let Err(e) = run_gpu_viewer(config) {
+        eprintln!("GPU viewer error: {}", e);
     }
 }
