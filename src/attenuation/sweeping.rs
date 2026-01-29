@@ -6,9 +6,7 @@
 //! Key optimizations:
 //! - Flat Vec<f32> for better cache locality
 //! - Parallel forward/reverse passes using rayon
-//! - Inlined propagation for hot path
-
-use super::AttenuationAlgorithm;
+//! - Hand-unrolled sweep loops for maximum performance
 
 /// Sweeping neighbor attenuation algorithm.
 ///
@@ -90,7 +88,7 @@ fn propagate(att: &[f32], decay: &[f32], ni: usize, mult: f32) -> f32 {
 }
 
 // ============================================================================
-// Four unique sweep patterns
+// Four sweep patterns (hand-unrolled for performance)
 // ============================================================================
 
 /// Sweep from top-left to bottom-right, checking left/up/up-left neighbors
@@ -100,20 +98,15 @@ fn sweep_tl_to_br(decay: &[f32], att: &mut [f32], w: usize, h: usize, diag: f32)
         for x in 0..w {
             let idx = y * w + x;
             let mut max_prop = att[idx];
-
-            // Left neighbor
             if x > 0 {
                 max_prop = max_prop.max(propagate(att, decay, idx - 1, 1.0));
             }
-            // Up neighbor
             if y > 0 {
                 max_prop = max_prop.max(propagate(att, decay, idx - w, 1.0));
             }
-            // Up-left diagonal
             if x > 0 && y > 0 {
                 max_prop = max_prop.max(propagate(att, decay, idx - w - 1, diag));
             }
-
             att[idx] = max_prop;
         }
     }
@@ -126,20 +119,15 @@ fn sweep_br_to_tl(decay: &[f32], att: &mut [f32], w: usize, h: usize, diag: f32)
         for x in (0..w).rev() {
             let idx = y * w + x;
             let mut max_prop = att[idx];
-
-            // Right neighbor
             if x + 1 < w {
                 max_prop = max_prop.max(propagate(att, decay, idx + 1, 1.0));
             }
-            // Down neighbor
             if y + 1 < h {
                 max_prop = max_prop.max(propagate(att, decay, idx + w, 1.0));
             }
-            // Down-right diagonal
             if x + 1 < w && y + 1 < h {
                 max_prop = max_prop.max(propagate(att, decay, idx + w + 1, diag));
             }
-
             att[idx] = max_prop;
         }
     }
@@ -152,12 +140,9 @@ fn sweep_down(decay: &[f32], att: &mut [f32], w: usize, h: usize, diag: f32) {
         for x in 0..w {
             let idx = y * w + x;
             let mut max_prop = att[idx];
-
-            // Left neighbor
             if x > 0 {
                 max_prop = max_prop.max(propagate(att, decay, idx - 1, 1.0));
             }
-            // Up neighbor and both upper diagonals
             if y > 0 {
                 max_prop = max_prop.max(propagate(att, decay, idx - w, 1.0));
                 if x > 0 {
@@ -167,7 +152,6 @@ fn sweep_down(decay: &[f32], att: &mut [f32], w: usize, h: usize, diag: f32) {
                     max_prop = max_prop.max(propagate(att, decay, idx - w + 1, diag));
                 }
             }
-
             att[idx] = max_prop;
         }
     }
@@ -180,12 +164,9 @@ fn sweep_up(decay: &[f32], att: &mut [f32], w: usize, h: usize, diag: f32) {
         for x in (0..w).rev() {
             let idx = y * w + x;
             let mut max_prop = att[idx];
-
-            // Right neighbor
             if x + 1 < w {
                 max_prop = max_prop.max(propagate(att, decay, idx + 1, 1.0));
             }
-            // Down neighbor and both lower diagonals
             if y + 1 < h {
                 max_prop = max_prop.max(propagate(att, decay, idx + w, 1.0));
                 if x > 0 {
@@ -195,7 +176,6 @@ fn sweep_up(decay: &[f32], att: &mut [f32], w: usize, h: usize, diag: f32) {
                     max_prop = max_prop.max(propagate(att, decay, idx + w + 1, diag));
                 }
             }
-
             att[idx] = max_prop;
         }
     }
@@ -224,19 +204,8 @@ fn run_reverse_sweeps(decay: &[f32], att: &mut [f32], w: usize, h: usize, diag: 
 }
 
 // ============================================================================
-// Trait implementation and grid conversion utilities
+// Grid conversion utilities
 // ============================================================================
-
-impl AttenuationAlgorithm for Sweeping {
-    fn calculate(&self, decay_grid: &Vec<Vec<f32>>, light_pos: (usize, usize)) -> Vec<Vec<f32>> {
-        let width = decay_grid.len();
-        let height = decay_grid[0].len();
-
-        let decay_flat = flatten_grid(decay_grid);
-        let result_flat = self.calculate_flat(&decay_flat, width, height, light_pos.0, light_pos.1);
-        unflatten_grid(&result_flat, width, height)
-    }
-}
 
 /// Convert Vec<Vec<f32>> to flat Vec<f32> (row-major: y * width + x)
 pub fn flatten_grid(grid: &Vec<Vec<f32>>) -> Vec<f32> {
@@ -249,15 +218,4 @@ pub fn flatten_grid(grid: &Vec<Vec<f32>>) -> Vec<f32> {
         }
     }
     flat
-}
-
-/// Convert flat Vec<f32> back to Vec<Vec<f32>>
-pub fn unflatten_grid(flat: &[f32], width: usize, height: usize) -> Vec<Vec<f32>> {
-    let mut grid = vec![vec![0.0f32; height]; width];
-    for x in 0..width {
-        for y in 0..height {
-            grid[x][y] = flat[y * width + x];
-        }
-    }
-    grid
 }

@@ -1,27 +1,11 @@
 //! Layer 1: Attenuation Calculation (pure geometry/physics)
 //!
-//! This module provides different algorithms for calculating light attenuation
-//! through a decay grid. All algorithms implement the `AttenuationAlgorithm` trait.
+//! This module provides the sweeping algorithm for calculating light attenuation
+//! through a decay grid using a flat memory layout for optimal performance.
 
 pub mod sweeping;
 
 pub use sweeping::{Sweeping, flatten_grid};
-
-/// Trait for light attenuation algorithms.
-///
-/// Implementations calculate how light propagates through a grid of decay values,
-/// returning attenuation percentages (0.0 to 1.0) for each cell.
-pub trait AttenuationAlgorithm {
-    /// Calculate light attenuation from a point light source.
-    ///
-    /// # Arguments
-    /// * `decay_grid` - 2D grid of decay values (0.0 = transparent, 1.0 = fully opaque)
-    /// * `light_pos` - Position of the light source (x, y)
-    ///
-    /// # Returns
-    /// Attenuation percentages (0.0 to 1.0) where 1.0 = full light, 0.0 = no light
-    fn calculate(&self, decay_grid: &Vec<Vec<f32>>, light_pos: (usize, usize)) -> Vec<Vec<f32>>;
-}
 
 /// Converts an attenuation grid to a formatted string for debugging
 pub fn attenuation_to_string(attenuation: &Vec<Vec<f32>>) -> String {

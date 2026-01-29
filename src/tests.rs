@@ -1,10 +1,25 @@
 //! Tests for the lighting system
 
-use crate::{Sweeping, AttenuationAlgorithm, ColoredLight, apply_light_color, blend_lights, rgba_grid_to_string};
+use crate::{Sweeping, flatten_grid, ColoredLight, apply_light_color, blend_lights, rgba_grid_to_string};
+
+/// Convert flat Vec<f32> back to Vec<Vec<f32>> (for test convenience)
+fn unflatten_grid(flat: &[f32], width: usize, height: usize) -> Vec<Vec<f32>> {
+    let mut grid = vec![vec![0.0f32; height]; width];
+    for x in 0..width {
+        for y in 0..height {
+            grid[x][y] = flat[y * width + x];
+        }
+    }
+    grid
+}
 
 // Helper to create default sweeping algorithm
 fn calculate_light_attenuation(decay_grid: &Vec<Vec<f32>>, light_pos: (usize, usize)) -> Vec<Vec<f32>> {
-    Sweeping::new().calculate(decay_grid, light_pos)
+    let width = decay_grid.len();
+    let height = decay_grid[0].len();
+    let decay_flat = flatten_grid(decay_grid);
+    let result_flat = Sweeping::new().calculate_flat(&decay_flat, width, height, light_pos.0, light_pos.1);
+    unflatten_grid(&result_flat, width, height)
 }
 
 #[test]

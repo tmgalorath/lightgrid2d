@@ -2,9 +2,8 @@
 
 use minifb::{Key, Window, WindowOptions, MouseMode, MouseButton};
 use rayon::prelude::*;
-use crate::attenuation::{Sweeping, AttenuationAlgorithm, flatten_grid};
-use crate::color::{RGBA, ColoredLight, apply_light_color};
-use crate::render::{normalize_grid_with_mode, NormalizationMode, to_byte};
+use crate::attenuation::Sweeping;
+use crate::render::{NormalizationMode, to_byte};
 
 /// Configuration for the interactive viewer
 #[derive(Clone)]
@@ -39,9 +38,8 @@ impl Default for ViewerConfig {
 /// Interactive viewer for testing lighting algorithms
 pub struct InteractiveViewer {
     config: ViewerConfig,
-    decay_grid: Vec<Vec<f32>>,
-    decay_flat: Vec<f32>,  // Cached flat version for fast algorithm
-    wall_grid: Vec<Vec<bool>>,
+    decay_flat: Vec<f32>,
+    wall_flat: Vec<bool>,
     window: Window,
     buffer: Vec<u32>,
 }
@@ -63,17 +61,15 @@ impl InteractiveViewer {
             },
         ).map_err(|e| e.to_string())?;
         
-        // Initialize decay grid with base decay
-        let decay_grid = vec![vec![config.base_decay; grid_h]; grid_w];
-        let decay_flat = flatten_grid(&decay_grid);
-        let wall_grid = vec![vec![false; grid_h]; grid_w];
+        // Initialize flat grids
+        let decay_flat = vec![config.base_decay; grid_w * grid_h];
+        let wall_flat = vec![false; grid_w * grid_h];
         let buffer = vec![0u32; window_w * window_h];
         
         Ok(Self {
             config,
-            decay_grid,
             decay_flat,
-            wall_grid,
+            wall_flat,
             window,
             buffer,
         })
@@ -226,60 +222,40 @@ impl InteractiveViewer {
     /// Toggle wall at grid position
     fn toggle_wall(&mut self, x: usize, y: usize) {
         let (grid_w, _grid_h) = self.config.grid_size;
-        self.wall_grid[x][y] = !self.wall_grid[x][y];
-        let decay_val = if self.wall_grid[x][y] {
+        let idx = y * grid_w + x;
+        self.wall_flat[idx] = !self.wall_flat[idx];
+        self.decay_flat[idx] = if self.wall_flat[idx] {
             self.config.wall_decay
         } else {
             self.config.base_decay
         };
-        self.decay_grid[x][y] = decay_val;
-        self.decay_flat[y * grid_w + x] = decay_val;
     }
     
     /// Clear all walls
     fn clear_walls(&mut self) {
-        let (grid_w, grid_h) = self.config.grid_size;
-        for x in 0..grid_w {
-            for y in 0..grid_h {
-                self.wall_grid[x][y] = false;
-                self.decay_grid[x][y] = self.config.base_decay;
-                self.decay_flat[y * grid_w + x] = self.config.base_decay;
-            }
-        }
+        self.wall_flat.fill(false);
+        self.decay_flat.fill(self.config.base_decay);
     }
     
     /// Update decay grid after base_decay change (preserves walls)
     fn update_decay_grid(&mut self) {
-        let (grid_w, grid_h) = self.config.grid_size;
-        for x in 0..grid_w {
-            for y in 0..grid_h {
-                if !self.wall_grid[x][y] {
-                    self.decay_grid[x][y] = self.config.base_decay;
-                    self.decay_flat[y * grid_w + x] = self.config.base_decay;
-                }
+        for (i, is_wall) in self.wall_flat.iter().enumerate() {
+            if !is_wall {
+                self.decay_flat[i] = self.config.base_decay;
             }
         }
     }
     
-    /// Render lighting from the given integer position
+    /// Render lighting from the given integer position (fully flat pipeline)
     fn render_lighting(&mut self, light_x: usize, light_y: usize, color: (f32, f32, f32), mode: NormalizationMode) {
+        let (grid_w, grid_h) = self.config.grid_size;
+        
         // Calculate attenuation using sweeping algorithm
         let sweeping = Sweeping::new();
-        let attenuation = sweeping.calculate(&self.decay_grid, (light_x, light_y));
+        let attenuation = sweeping.calculate_flat(&self.decay_flat, grid_w, grid_h, light_x, light_y);
         
-        // Apply light color
-        let light = ColoredLight {
-            color,
-            intensity: 1.0,
-            position: (light_x, light_y),
-        };
-        let colored = apply_light_color(&attenuation, &light);
-        
-        // Normalize
-        let normalized = normalize_grid_with_mode(&colored, mode);
-        
-        // Render to buffer
-        self.render_grid_to_buffer(&normalized);
+        // Render directly to buffer (fused color + normalize + write)
+        self.render_flat_to_buffer(&attenuation, color, mode);
     }
     
     /// Render lighting with bilinear blending for subpixel positions
@@ -287,6 +263,7 @@ impl InteractiveViewer {
     /// Uses rayon thread pool and flat memory layout for best performance
     fn render_lighting_bilinear(&mut self, subpixel_x: f32, subpixel_y: f32, color: (f32, f32, f32), mode: NormalizationMode) {
         let (grid_w, grid_h) = self.config.grid_size;
+        let size = grid_w * grid_h;
         
         // Get the 4 corner cell positions
         let x0 = (subpixel_x.floor() as usize).min(grid_w - 1);
@@ -316,55 +293,68 @@ impl InteractiveViewer {
             })
             .collect();
         
-        // Blend all 4 grids and apply color in one pass
+        // Blend all 4 grids into a single flat buffer
         let weights = [w00, w10, w01, w11];
-        let mut blended: Vec<Vec<RGBA>> = vec![vec![RGBA::black(); grid_h]; grid_w];
+        let mut blended = vec![0.0f32; size];
         
-        for x in 0..grid_w {
-            for y in 0..grid_h {
-                let idx = y * grid_w + x;
-                let att = grids[0][idx] * weights[0] 
-                        + grids[1][idx] * weights[1] 
-                        + grids[2][idx] * weights[2] 
-                        + grids[3][idx] * weights[3];
-                
-                blended[x][y] = RGBA {
-                    r: color.0 * att,
-                    g: color.1 * att,
-                    b: color.2 * att,
-                    a: 1.0,
-                };
-            }
+        for i in 0..size {
+            blended[i] = grids[0][i] * weights[0] 
+                       + grids[1][i] * weights[1] 
+                       + grids[2][i] * weights[2] 
+                       + grids[3][i] * weights[3];
         }
         
-        // Normalize
-        let normalized = normalize_grid_with_mode(&blended, mode);
-        
-        // Render to buffer
-        self.render_grid_to_buffer(&normalized);
+        // Render directly to buffer (fused color + normalize + write)
+        self.render_flat_to_buffer(&blended, color, mode);
     }
     
-    /// Render an RGBA grid to the pixel buffer
-    fn render_grid_to_buffer(&mut self, grid: &Vec<Vec<RGBA>>) {
+    /// Render flat attenuation directly to pixel buffer
+    /// Fuses color application, normalization, and buffer write in one pass
+    fn render_flat_to_buffer(&mut self, attenuation: &[f32], color: (f32, f32, f32), mode: NormalizationMode) {
         let (grid_w, grid_h) = self.config.grid_size;
         let scale = self.config.scale;
         
-        for gx in 0..grid_w {
-            for gy in 0..grid_h {
-                let pixel = &grid[gx][gy];
+        // Calculate normalization factor based on mode
+        let norm_factor = match mode {
+            NormalizationMode::Standard => {
+                // Find max colored value
+                let max_att = attenuation.iter().cloned().fold(0.0f32, f32::max);
+                let max_colored = max_att * color.0.max(color.1).max(color.2);
+                if max_colored > 0.0 { 1.0 / max_colored } else { 1.0 }
+            }
+            NormalizationMode::BrightnessLimit(limit) => {
+                // OSB-style: clamp to limit
+                1.0 / limit
+            }
+            NormalizationMode::PerceptualLuminance(target) => {
+                // Perceptual: based on luminance
+                let max_att = attenuation.iter().cloned().fold(0.0f32, f32::max);
+                let max_lum = max_att * (0.2126 * color.0 + 0.7152 * color.1 + 0.0722 * color.2);
+                if max_lum > 0.0 { target / max_lum } else { 1.0 }
+            }
+        };
+        
+        // Render each cell
+        for gy in 0..grid_h {
+            for gx in 0..grid_w {
+                let idx = gy * grid_w + gx;
+                let att = attenuation[idx];
                 
-                // Convert RGBA to u32 (0xAARRGGBB format for minifb)
-                let r = to_byte(pixel.r) as u32;
-                let g = to_byte(pixel.g) as u32;
-                let b = to_byte(pixel.b) as u32;
+                // Apply color, intensity, and normalization
+                let r_f = (color.0 * att * norm_factor).min(1.0);
+                let g_f = (color.1 * att * norm_factor).min(1.0);
+                let b_f = (color.2 * att * norm_factor).min(1.0);
+                
+                let mut r = to_byte(r_f) as u32;
+                let mut g = to_byte(g_f) as u32;
+                let mut b = to_byte(b_f) as u32;
                 
                 // If it's a wall, add a slight tint to make it visible
-                let (r, g, b) = if self.wall_grid[gx][gy] {
-                    // Dark gray for walls
-                    (r.max(30), g.max(30), b.max(30))
-                } else {
-                    (r, g, b)
-                };
+                if self.wall_flat[idx] {
+                    r = r.max(30);
+                    g = g.max(30);
+                    b = b.max(30);
+                }
                 
                 let color_u32 = (r << 16) | (g << 8) | b;
                 
@@ -373,8 +363,8 @@ impl InteractiveViewer {
                     for sx in 0..scale {
                         let px = gx * scale + sx;
                         let py = gy * scale + sy;
-                        let idx = py * (grid_w * scale) + px;
-                        self.buffer[idx] = color_u32;
+                        let buf_idx = py * (grid_w * scale) + px;
+                        self.buffer[buf_idx] = color_u32;
                     }
                 }
             }
