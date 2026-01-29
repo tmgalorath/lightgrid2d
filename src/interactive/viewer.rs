@@ -252,7 +252,7 @@ impl InteractiveViewer {
         
         // Calculate attenuation using sweeping algorithm
         let sweeping = Sweeping::new();
-        let attenuation = sweeping.calculate_flat(&self.decay_flat, grid_w, grid_h, light_x, light_y);
+        let attenuation = sweeping.calculate_flat(&self.decay_flat, grid_w, grid_h, light_x, light_y, 1.0);
         
         // Render directly to buffer (fused color + normalize + write)
         self.render_flat_to_buffer(&attenuation, color, mode);
@@ -289,7 +289,7 @@ impl InteractiveViewer {
             .par_iter()
             .map(|&(lx, ly)| {
                 let sweeping = Sweeping::new();
-                sweeping.calculate_flat(decay_flat, grid_w, grid_h, lx, ly)
+                sweeping.calculate_flat(decay_flat, grid_w, grid_h, lx, ly, 1.0)
             })
             .collect();
         

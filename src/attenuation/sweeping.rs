@@ -41,6 +41,8 @@ impl Sweeping {
 
     /// Calculate attenuation with flat memory layout.
     /// Returns a flat Vec<f32> with row-major order: index = y * width + x
+    /// 
+    /// `source_intensity` controls the initial brightness at the light source (0.0-1.0)
     pub fn calculate_flat(
         &self,
         decay_flat: &[f32],
@@ -48,6 +50,7 @@ impl Sweeping {
         height: usize,
         light_x: usize,
         light_y: usize,
+        source_intensity: f32,
     ) -> Vec<f32> {
         let diag = self.diagonal_decay_mult;
         let light_idx = light_y * width + light_x;
@@ -56,13 +59,13 @@ impl Sweeping {
         let (mut forward, reverse) = rayon::join(
             || {
                 let mut grid = vec![0.0f32; width * height];
-                grid[light_idx] = 1.0;
+                grid[light_idx] = source_intensity;
                 run_forward_sweeps(decay_flat, &mut grid, width, height, diag);
                 grid
             },
             || {
                 let mut grid = vec![0.0f32; width * height];
-                grid[light_idx] = 1.0;
+                grid[light_idx] = source_intensity;
                 run_reverse_sweeps(decay_flat, &mut grid, width, height, diag);
                 grid
             },

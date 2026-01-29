@@ -18,7 +18,7 @@ fn calculate_light_attenuation(decay_grid: &Vec<Vec<f32>>, light_pos: (usize, us
     let width = decay_grid.len();
     let height = decay_grid[0].len();
     let decay_flat = flatten_grid(decay_grid);
-    let result_flat = Sweeping::new().calculate_flat(&decay_flat, width, height, light_pos.0, light_pos.1);
+    let result_flat = Sweeping::new().calculate_flat(&decay_flat, width, height, light_pos.0, light_pos.1, 1.0);
     unflatten_grid(&result_flat, width, height)
 }
 

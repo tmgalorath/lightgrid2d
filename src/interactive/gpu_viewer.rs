@@ -11,7 +11,7 @@ use winit::{
 use rayon::prelude::*;
 
 use crate::attenuation::Sweeping;
-use crate::gpu::{GpuContext, DisplayPipeline};
+use crate::gpu::{GpuContext, DisplayPipeline, BlendPipeline, BlendToTexturePipeline, BlendUniforms, BlurPipeline, WallOverlayPipeline};
 use crate::render::NormalizationMode;
 
 /// Configuration for the GPU viewer
@@ -49,25 +49,75 @@ struct ViewerState {
     config: GpuViewerConfig,
     gpu_ctx: GpuContext,
     display_pipeline: DisplayPipeline,
+    blend_pipeline: BlendPipeline,
+    blend_to_texture_pipeline: BlendToTexturePipeline,
+    blur_pipeline: BlurPipeline,
+    wall_overlay_pipeline: WallOverlayPipeline,
+    texture_bind_group: wgpu::BindGroup,
     
     // Lighting state
     decay_flat: Vec<f32>,
     wall_flat: Vec<bool>,
-    pixel_buffer: Vec<u8>, // RGBA8 for GPU upload
+    pixel_buffer: Vec<u8>, // RGBA8 for CPU fallback
     
     // Interaction state
     current_color: (f32, f32, f32),
     current_mode: NormalizationMode,
     subpixel_enabled: bool,
+    use_gpu_blend: bool,
+    use_srgb: bool,
+    use_linear_filter: bool,
+    blur_level: u32,  // 0 = off, 1-3 = blur iterations
     mouse_pos: Option<(f32, f32)>,
     left_mouse_down: bool,
     last_wall_pos: Option<(usize, usize)>,
+    
+    // Placed lights
+    placed_lights: Vec<(usize, usize)>,
+    mouse_light_enabled: bool,
+    
+    // Light source intensity
+    source_intensity: f32,
 }
 
 impl ViewerState {
     fn new(window: Arc<Window>, config: GpuViewerConfig) -> Result<Self, String> {
         let gpu_ctx = GpuContext::new(window)?;
         let display_pipeline = DisplayPipeline::new(&gpu_ctx);
+        let blend_pipeline = BlendPipeline::new(
+            &gpu_ctx,
+            config.grid_size.0 as u32,
+            config.grid_size.1 as u32,
+        );
+        let blend_to_texture_pipeline = BlendToTexturePipeline::new(
+            &gpu_ctx,
+            config.grid_size.0 as u32,
+            config.grid_size.1 as u32,
+        );
+        
+        let mut blur_pipeline = BlurPipeline::new(
+            &gpu_ctx,
+            config.grid_size.0 as u32,
+            config.grid_size.1 as u32,
+        );
+        
+        // Set up blur to work on the blend output texture
+        blur_pipeline.setup_for_texture(&gpu_ctx, blend_to_texture_pipeline.output_texture_view());
+        
+        // Set up wall overlay to work on the blend output texture
+        let mut wall_overlay_pipeline = WallOverlayPipeline::new(
+            &gpu_ctx,
+            config.grid_size.0 as u32,
+            config.grid_size.1 as u32,
+        );
+        wall_overlay_pipeline.setup_for_texture(&gpu_ctx, blend_to_texture_pipeline.output_texture_view());
+        
+        // Create bind group for the compute output texture
+        let texture_bind_group = display_pipeline.create_bind_group_for_texture(
+            &gpu_ctx,
+            blend_to_texture_pipeline.output_texture_view(),
+            false, // Start with nearest (crisp pixels)
+        );
         
         let (grid_w, grid_h) = config.grid_size;
         let decay_flat = vec![config.base_decay; grid_w * grid_h];
@@ -81,16 +131,36 @@ impl ViewerState {
             config,
             gpu_ctx,
             display_pipeline,
+            blend_pipeline,
+            blend_to_texture_pipeline,
+            blur_pipeline,
+            wall_overlay_pipeline,
+            texture_bind_group,
             decay_flat,
             wall_flat,
             pixel_buffer,
             current_color,
             current_mode,
             subpixel_enabled: true,
+            use_gpu_blend: true,
+            use_srgb: false,
+            use_linear_filter: false,
+            blur_level: 0,
             mouse_pos: None,
             left_mouse_down: false,
             last_wall_pos: None,
+            placed_lights: Vec::new(),
+            mouse_light_enabled: true,
+            source_intensity: 1.0,
         })
+    }
+    
+    fn update_texture_bind_group(&mut self) {
+        self.texture_bind_group = self.display_pipeline.create_bind_group_for_texture(
+            &self.gpu_ctx,
+            self.blend_to_texture_pipeline.output_texture_view(),
+            self.use_linear_filter,
+        );
     }
     
     fn toggle_wall(&mut self, x: usize, y: usize) {
@@ -109,6 +179,102 @@ impl ViewerState {
         self.decay_flat.fill(self.config.base_decay);
     }
     
+    fn place_light(&mut self, x: usize, y: usize) {
+        // Don't place lights in walls
+        let (grid_w, _) = self.config.grid_size;
+        let idx = y * grid_w + x;
+        if !self.wall_flat[idx] {
+            self.placed_lights.push((x, y));
+            println!("Placed light at ({}, {}). Total lights: {}", x, y, self.placed_lights.len());
+        } else {
+            println!("Cannot place light in a wall!");
+        }
+    }
+    
+    fn clear_lights(&mut self) {
+        self.placed_lights.clear();
+        println!("Cleared all placed lights");
+    }
+    
+    /// Generate a cave pattern using cellular automata
+    fn generate_cave(&mut self) {
+        let (width, height) = self.config.grid_size;
+        
+        // Step 1: Initialize with random noise (~45% walls)
+        use std::collections::hash_map::DefaultHasher;
+        use std::hash::{Hash, Hasher};
+        use std::time::{SystemTime, UNIX_EPOCH};
+        
+        // Simple seeded random using time
+        let seed = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos() as u64;
+        
+        let mut hasher = DefaultHasher::new();
+        for i in 0..self.wall_flat.len() {
+            (seed, i).hash(&mut hasher);
+            let hash = hasher.finish();
+            hasher = DefaultHasher::new();
+            self.wall_flat[i] = (hash % 100) < 45; // 45% chance of wall
+        }
+        
+        // Step 2: Apply cellular automata rules (5 iterations)
+        let mut temp = vec![false; width * height];
+        
+        for _ in 0..5 {
+            for y in 0..height {
+                for x in 0..width {
+                    let idx = y * width + x;
+                    
+                    // Count walls in 3x3 neighborhood (including self)
+                    let mut wall_count = 0;
+                    for dy in -1i32..=1 {
+                        for dx in -1i32..=1 {
+                            let nx = x as i32 + dx;
+                            let ny = y as i32 + dy;
+                            
+                            // Treat out-of-bounds as walls (creates solid borders)
+                            if nx < 0 || nx >= width as i32 || ny < 0 || ny >= height as i32 {
+                                wall_count += 1;
+                            } else {
+                                let ni = ny as usize * width + nx as usize;
+                                if self.wall_flat[ni] {
+                                    wall_count += 1;
+                                }
+                            }
+                        }
+                    }
+                    
+                    // Rule: become wall if >= 5 neighbors are walls
+                    temp[idx] = wall_count >= 5;
+                }
+            }
+            
+            // Swap buffers
+            std::mem::swap(&mut self.wall_flat, &mut temp);
+        }
+        
+        // Step 3: Ensure borders are walls (for a contained cave)
+        for x in 0..width {
+            self.wall_flat[x] = true;                           // Top row
+            self.wall_flat[(height - 1) * width + x] = true;    // Bottom row
+        }
+        for y in 0..height {
+            self.wall_flat[y * width] = true;                   // Left column
+            self.wall_flat[y * width + (width - 1)] = true;     // Right column
+        }
+        
+        // Step 4: Update decay grid to match walls
+        for (i, &is_wall) in self.wall_flat.iter().enumerate() {
+            self.decay_flat[i] = if is_wall {
+                self.config.wall_decay
+            } else {
+                self.config.base_decay
+            };
+        }
+    }
+    
     fn update_decay_grid(&mut self) {
         for (i, is_wall) in self.wall_flat.iter().enumerate() {
             if !is_wall {
@@ -121,9 +287,13 @@ impl ViewerState {
         let (grid_w, grid_h) = self.config.grid_size;
         
         let sweeping = Sweeping::new();
-        let attenuation = sweeping.calculate_flat(&self.decay_flat, grid_w, grid_h, light_x, light_y);
+        let attenuation = sweeping.calculate_flat(&self.decay_flat, grid_w, grid_h, light_x, light_y, self.source_intensity);
         
-        self.render_attenuation_to_buffer(&attenuation);
+        if self.use_gpu_blend {
+            self.render_single_gpu(&attenuation);
+        } else {
+            self.render_attenuation_to_buffer(&attenuation);
+        }
     }
     
     fn render_lighting_bilinear(&mut self, subpixel_x: f32, subpixel_y: f32) {
@@ -145,26 +315,203 @@ impl ViewerState {
         let positions = [(x0, y0), (x1, y0), (x0, y1), (x1, y1)];
         let decay_flat = &self.decay_flat;
         
+        // Calculate 4 grids in parallel (CPU)
         let grids: Vec<Vec<f32>> = positions
             .par_iter()
             .map(|&(lx, ly)| {
                 let sweeping = Sweeping::new();
-                sweeping.calculate_flat(decay_flat, grid_w, grid_h, lx, ly)
+                sweeping.calculate_flat(decay_flat, grid_w, grid_h, lx, ly, 1.0)
             })
             .collect();
         
-        let weights = [w00, w10, w01, w11];
-        let size = grid_w * grid_h;
-        let mut blended = vec![0.0f32; size];
+        if self.use_gpu_blend {
+            // GPU path: upload grids and run compute shader
+            self.render_bilinear_gpu(&grids, [w00, w10, w01, w11]);
+        } else {
+            // CPU path: blend on CPU
+            let weights = [w00, w10, w01, w11];
+            let size = grid_w * grid_h;
+            let mut blended = vec![0.0f32; size];
+            
+            for i in 0..size {
+                blended[i] = grids[0][i] * weights[0]
+                           + grids[1][i] * weights[1]
+                           + grids[2][i] * weights[2]
+                           + grids[3][i] * weights[3];
+            }
+            
+            self.render_attenuation_to_buffer(&blended);
+        }
+    }
+    
+    fn render_bilinear_gpu(&mut self, grids: &[Vec<f32>], weights: [f32; 4]) {
+        let (grid_w, grid_h) = self.config.grid_size;
+        let color = self.current_color;
+        let mode = self.current_mode;
         
-        for i in 0..size {
-            blended[i] = grids[0][i] * weights[0]
-                       + grids[1][i] * weights[1]
-                       + grids[2][i] * weights[2]
-                       + grids[3][i] * weights[3];
+        // Calculate normalization factor (still need max from grids)
+        let max_blended: f32 = (0..grid_w * grid_h)
+            .map(|i| {
+                grids[0][i] * weights[0]
+                + grids[1][i] * weights[1]
+                + grids[2][i] * weights[2]
+                + grids[3][i] * weights[3]
+            })
+            .fold(0.0f32, f32::max);
+        
+        let norm_factor = match mode {
+            NormalizationMode::Standard => {
+                let max_colored = max_blended * color.0.max(color.1).max(color.2);
+                if max_colored > 0.0 { 1.0 / max_colored } else { 1.0 }
+            }
+            NormalizationMode::BrightnessLimit(limit) => 1.0 / limit,
+            NormalizationMode::PerceptualLuminance(target) => {
+                let max_lum = max_blended * (0.2126 * color.0 + 0.7152 * color.1 + 0.0722 * color.2);
+                if max_lum > 0.0 { target / max_lum } else { 1.0 }
+            }
+        };
+        
+        // Upload to GPU
+        self.blend_pipeline.upload_grids(
+            &self.gpu_ctx,
+            &[&grids[0], &grids[1], &grids[2], &grids[3]],
+        );
+        self.blend_pipeline.upload_walls(&self.gpu_ctx, &self.wall_flat);
+        
+        let uniforms = BlendUniforms {
+            weights,
+            color: [color.0, color.1, color.2],
+            norm_factor,
+            grid_width: grid_w as u32,
+            grid_height: grid_h as u32,
+            apply_srgb: if self.use_srgb { 1 } else { 0 },
+            _padding: 0,
+        };
+        
+        // Use optimized texture pipeline (no readback!)
+        self.blend_to_texture_pipeline.upload_grids(
+            &self.gpu_ctx,
+            &[&grids[0], &grids[1], &grids[2], &grids[3]],
+        );
+        self.blend_to_texture_pipeline.upload_walls(&self.gpu_ctx, &self.wall_flat);
+        self.blend_to_texture_pipeline.upload_uniforms(&self.gpu_ctx, &uniforms);
+        
+        // Run compute shader → writes directly to texture
+        self.blend_to_texture_pipeline.dispatch_blend(&self.gpu_ctx);
+        
+        // Apply blur if enabled
+        if self.blur_level > 0 {
+            self.blur_pipeline.dispatch_iterations(&self.gpu_ctx, self.blur_level);
         }
         
-        self.render_attenuation_to_buffer(&blended);
+        // Apply wall overlay (always, to show walls after blur or when blur is off)
+        self.wall_overlay_pipeline.upload_walls(&self.gpu_ctx, &self.wall_flat);
+        self.wall_overlay_pipeline.dispatch(&self.gpu_ctx);
+        
+        // No readback needed! Display will use texture_bind_group
+    }
+    
+    fn render_single_gpu(&mut self, attenuation: &[f32]) {
+        let (grid_w, grid_h) = self.config.grid_size;
+        let color = self.current_color;
+        let mode = self.current_mode;
+        
+        // Calculate normalization factor
+        // Adjust max by source_intensity so dimmer lights actually appear dimmer
+        let max_att = attenuation.iter().cloned().fold(0.0f32, f32::max) / self.source_intensity;
+        let norm_factor = match mode {
+            NormalizationMode::Standard => {
+                let max_colored = max_att * color.0.max(color.1).max(color.2);
+                if max_colored > 0.0 { 1.0 / max_colored } else { 1.0 }
+            }
+            NormalizationMode::BrightnessLimit(limit) => 1.0 / limit,
+            NormalizationMode::PerceptualLuminance(target) => {
+                let max_lum = max_att * (0.2126 * color.0 + 0.7152 * color.1 + 0.0722 * color.2);
+                if max_lum > 0.0 { target / max_lum } else { 1.0 }
+            }
+        };
+        
+        let uniforms = BlendUniforms {
+            weights: [1.0, 0.0, 0.0, 0.0],
+            color: [color.0, color.1, color.2],
+            norm_factor,
+            grid_width: grid_w as u32,
+            grid_height: grid_h as u32,
+            apply_srgb: if self.use_srgb { 1 } else { 0 },
+            _padding: 0,
+        };
+        
+        // Use optimized texture pipeline (no readback!)
+        self.blend_to_texture_pipeline.upload_single_grid(&self.gpu_ctx, attenuation);
+        self.blend_to_texture_pipeline.upload_walls(&self.gpu_ctx, &self.wall_flat);
+        self.blend_to_texture_pipeline.upload_uniforms(&self.gpu_ctx, &uniforms);
+        
+        // Run compute shader → writes directly to texture
+        self.blend_to_texture_pipeline.dispatch_single(&self.gpu_ctx);
+        
+        // Apply blur if enabled
+        if self.blur_level > 0 {
+            self.blur_pipeline.dispatch_iterations(&self.gpu_ctx, self.blur_level);
+        }
+        
+        // Apply wall overlay (always, to show walls after blur or when blur is off)
+        self.wall_overlay_pipeline.upload_walls(&self.gpu_ctx, &self.wall_flat);
+        self.wall_overlay_pipeline.dispatch(&self.gpu_ctx);
+        
+        // No readback needed!
+    }
+    
+    fn read_compute_output_to_pixel_buffer(&mut self) {
+        let (grid_w, grid_h) = self.config.grid_size;
+        let num_pixels = grid_w * grid_h;
+        let buffer_size = (num_pixels * std::mem::size_of::<u32>()) as u64;
+        
+        // Create staging buffer for readback
+        let staging_buffer = self.gpu_ctx.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("Staging Buffer"),
+            size: buffer_size,
+            usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        
+        // Copy from output buffer to staging buffer
+        let mut encoder = self.gpu_ctx.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("Copy Encoder"),
+        });
+        encoder.copy_buffer_to_buffer(
+            self.blend_pipeline.output_buffer(),
+            0,
+            &staging_buffer,
+            0,
+            buffer_size,
+        );
+        self.gpu_ctx.queue.submit(std::iter::once(encoder.finish()));
+        
+        // Map and read the staging buffer
+        let buffer_slice = staging_buffer.slice(..);
+        buffer_slice.map_async(wgpu::MapMode::Read, |_| {});
+        self.gpu_ctx.device.poll(wgpu::Maintain::Wait);
+        
+        {
+            let data = buffer_slice.get_mapped_range();
+            let pixels: &[u32] = bytemuck::cast_slice(&data);
+            
+            // Convert 0xAARRGGBB to RGBA8
+            for (i, &pixel) in pixels.iter().enumerate() {
+                let a = ((pixel >> 24) & 0xFF) as u8;
+                let r = ((pixel >> 16) & 0xFF) as u8;
+                let g = ((pixel >> 8) & 0xFF) as u8;
+                let b = (pixel & 0xFF) as u8;
+                
+                let idx = i * 4;
+                self.pixel_buffer[idx] = r;
+                self.pixel_buffer[idx + 1] = g;
+                self.pixel_buffer[idx + 2] = b;
+                self.pixel_buffer[idx + 3] = a;
+            }
+        }
+        
+        staging_buffer.unmap();
     }
     
     fn render_attenuation_to_buffer(&mut self, attenuation: &[f32]) {
@@ -173,15 +520,16 @@ impl ViewerState {
         let mode = self.current_mode;
         
         // Calculate normalization factor
+        // Adjust max by source_intensity so dimmer lights actually appear dimmer
         let norm_factor = match mode {
             NormalizationMode::Standard => {
-                let max_att = attenuation.iter().cloned().fold(0.0f32, f32::max);
+                let max_att = attenuation.iter().cloned().fold(0.0f32, f32::max) / self.source_intensity;
                 let max_colored = max_att * color.0.max(color.1).max(color.2);
                 if max_colored > 0.0 { 1.0 / max_colored } else { 1.0 }
             }
             NormalizationMode::BrightnessLimit(limit) => 1.0 / limit,
             NormalizationMode::PerceptualLuminance(target) => {
-                let max_att = attenuation.iter().cloned().fold(0.0f32, f32::max);
+                let max_att = attenuation.iter().cloned().fold(0.0f32, f32::max) / self.source_intensity;
                 let max_lum = max_att * (0.2126 * color.0 + 0.7152 * color.1 + 0.0722 * color.2);
                 if max_lum > 0.0 { target / max_lum } else { 1.0 }
             }
@@ -213,9 +561,59 @@ impl ViewerState {
         }
     }
     
+    /// Render multiple light sources, combining with max to avoid over-saturation
+    fn render_multi_lights(&mut self, lights: &[(usize, usize)]) {
+        let (grid_w, grid_h) = self.config.grid_size;
+        let size = grid_w * grid_h;
+        let decay_flat = &self.decay_flat;
+        let source_intensity = self.source_intensity;
+        
+        // Calculate attenuation for each light in parallel
+        let grids: Vec<Vec<f32>> = lights
+            .par_iter()
+            .map(|&(lx, ly)| {
+                let sweeping = Sweeping::new();
+                sweeping.calculate_flat(decay_flat, grid_w, grid_h, lx, ly, source_intensity)
+            })
+            .collect();
+        
+        // Combine all grids using max (prevents over-saturation)
+        let mut combined = vec![0.0f32; size];
+        for grid in &grids {
+            for i in 0..size {
+                combined[i] = combined[i].max(grid[i]);
+            }
+        }
+        
+        // Render the combined result
+        if self.use_gpu_blend {
+            self.render_single_gpu(&combined);
+        } else {
+            self.render_attenuation_to_buffer(&combined);
+        }
+    }
+    
+    /// Render with no light sources (just walls visible)
+    fn render_no_lights(&mut self) {
+        let (grid_w, grid_h) = self.config.grid_size;
+        let size = grid_w * grid_h;
+        
+        // All-zero attenuation
+        let combined = vec![0.0f32; size];
+        
+        if self.use_gpu_blend {
+            self.render_single_gpu(&combined);
+        } else {
+            self.render_attenuation_to_buffer(&combined);
+        }
+    }
+    
     fn update_and_render(&mut self) {
         let (grid_w, grid_h) = self.config.grid_size;
         let window_size = self.gpu_ctx.size;
+        
+        // Collect all light sources
+        let mut all_lights: Vec<(usize, usize)> = self.placed_lights.clone();
         
         if let Some((mx, my)) = self.mouse_pos {
             // Convert window coords to grid coords
@@ -236,29 +634,41 @@ impl ViewerState {
                 }
             }
             
-            // Render lighting
-            if self.subpixel_enabled {
-                self.render_lighting_bilinear(subpixel_x, subpixel_y);
-            } else {
-                let render_x = (subpixel_x.round() as usize).min(grid_w - 1);
-                let render_y = (subpixel_y.round() as usize).min(grid_h - 1);
-                self.render_lighting(render_x, render_y);
+            // Add mouse light if enabled
+            if self.mouse_light_enabled {
+                all_lights.push((grid_x, grid_y));
             }
-        } else {
-            // No mouse position, render from center
-            self.render_lighting(grid_w / 2, grid_h / 2);
+        } else if self.mouse_light_enabled && all_lights.is_empty() {
+            // No mouse position, no placed lights, render from center
+            all_lights.push((grid_w / 2, grid_h / 2));
         }
         
-        // Upload to GPU and render
-        self.display_pipeline.update_texture(
-            &self.gpu_ctx,
-            grid_w as u32,
-            grid_h as u32,
-            &self.pixel_buffer,
-        );
+        // Render lighting with all light sources
+        if !all_lights.is_empty() {
+            self.render_multi_lights(&all_lights);
+        } else {
+            // No lights at all - render a dark scene
+            self.render_no_lights();
+        }
         
-        if let Err(e) = self.display_pipeline.render(&self.gpu_ctx) {
-            log::error!("Render error: {:?}", e);
+        // Render to screen
+        if self.use_gpu_blend {
+            // GPU path: render directly from compute output texture (no readback!)
+            if let Err(e) = self.display_pipeline.render_with_bind_group(&self.gpu_ctx, &self.texture_bind_group) {
+                log::error!("Render error: {:?}", e);
+            }
+        } else {
+            // CPU path: upload pixel buffer to texture
+            self.display_pipeline.update_texture(
+                &self.gpu_ctx,
+                grid_w as u32,
+                grid_h as u32,
+                &self.pixel_buffer,
+            );
+            
+            if let Err(e) = self.display_pipeline.render(&self.gpu_ctx) {
+                log::error!("Render error: {:?}", e);
+            }
         }
     }
 }
@@ -301,10 +711,19 @@ impl ApplicationHandler for GpuViewerApp {
                 println!("Controls:");
                 println!("  Mouse      - Move light source");
                 println!("  Left Click - Toggle wall");
+                println!("  Space      - Place light at mouse position");
+                println!("  M          - Toggle mouse light ON/OFF");
+                println!("  X          - Clear all placed lights");
                 println!("  1/2/3      - Normalization: Standard/OSB/Perceptual");
                 println!("  R/G/B/Y/W  - Color: Red/Green/Blue/Yellow/White");
                 println!("  +/-        - Adjust decay rate");
                 println!("  T          - Toggle subpixel blending ON/OFF");
+                println!("  P          - Toggle GPU compute ON/OFF");
+                println!("  S          - Toggle sRGB/Linear output");
+                println!("  F          - Toggle filter: Nearest/Linear (smooth)");
+                println!("  L          - Cycle blur: OFF/Light/Medium/Heavy");
+                println!("  [/]        - Adjust source intensity");
+                println!("  V          - Generate random cave");
                 println!("  C          - Clear walls");
                 println!("  ESC        - Exit");
                 println!();
@@ -398,9 +817,92 @@ impl ApplicationHandler for GpuViewerApp {
                         }
                     }
                     
+                    KeyCode::KeyP => {
+                        state.use_gpu_blend = !state.use_gpu_blend;
+                        if state.use_gpu_blend {
+                            println!("GPU compute: ON");
+                        } else {
+                            println!("GPU compute: OFF (CPU fallback)");
+                        }
+                    }
+                    
+                    KeyCode::KeyS => {
+                        state.use_srgb = !state.use_srgb;
+                        if state.use_srgb {
+                            println!("Output: sRGB (gamma encoded, tighter falloff)");
+                        } else {
+                            println!("Output: Linear (physically correct, wider falloff)");
+                        }
+                    }
+                    
+                    KeyCode::KeyF => {
+                        state.use_linear_filter = !state.use_linear_filter;
+                        state.update_texture_bind_group();
+                        if state.use_linear_filter {
+                            println!("Filter: Linear (smooth)");
+                        } else {
+                            println!("Filter: Nearest (crisp pixels)");
+                        }
+                    }
+                    
+                    KeyCode::KeyL => {
+                        // Cycle blur level: 0 -> 1 -> 2 -> 3 -> 0
+                        state.blur_level = (state.blur_level + 1) % 4;
+                        match state.blur_level {
+                            0 => println!("Blur: OFF"),
+                            1 => println!("Blur: Light (1 pass)"),
+                            2 => println!("Blur: Medium (2 passes)"),
+                            3 => println!("Blur: Heavy (3 passes)"),
+                            _ => {}
+                        }
+                    }
+                    
                     KeyCode::KeyC => {
                         state.clear_walls();
                         println!("Walls cleared");
+                    }
+                    
+                    KeyCode::KeyV => {
+                        state.generate_cave();
+                        println!("Generated cave pattern");
+                    }
+                    
+                    KeyCode::Space => {
+                        // Place a light at current mouse position
+                        if let Some((mx, my)) = state.mouse_pos {
+                            let (grid_w, grid_h) = state.config.grid_size;
+                            let window_size = state.gpu_ctx.size;
+                            let scale_x = window_size.0 as f32 / grid_w as f32;
+                            let scale_y = window_size.1 as f32 / grid_h as f32;
+                            let grid_x = (mx / scale_x) as usize;
+                            let grid_y = (my / scale_y) as usize;
+                            let grid_x = grid_x.min(grid_w - 1);
+                            let grid_y = grid_y.min(grid_h - 1);
+                            state.place_light(grid_x, grid_y);
+                        }
+                    }
+                    
+                    KeyCode::KeyM => {
+                        state.mouse_light_enabled = !state.mouse_light_enabled;
+                        if state.mouse_light_enabled {
+                            println!("Mouse light: ON");
+                        } else {
+                            println!("Mouse light: OFF");
+                        }
+                    }
+                    
+                    KeyCode::KeyX => {
+                        state.clear_lights();
+                    }
+                    
+                    KeyCode::BracketLeft => {
+                        state.source_intensity = (state.source_intensity - 0.1).max(0.1);
+                        println!("Source intensity: {:.1}", state.source_intensity);
+                    }
+                    
+                    KeyCode::BracketRight => {
+                        state.source_intensity = (state.source_intensity + 0.1).min(2.0);
+                        println!("Source intensity: {:.1}", state.source_intensity);
                     }
                     
                     _ => {}
